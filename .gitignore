@@ -1,0 +1,24 @@
+# 构建产物(可由 build.cmd 全量再生)
+build/
+*.obj
+*.sys
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+
+# 诊断/测试杂物与大体积取证(保留在本地)
+evidence/
+*.log
+*.txt
+*.bin
+*.png
+*.html
+recv/
+dump/
+vmext/
+
+# 会话/编辑器
+.vs/
+*.user

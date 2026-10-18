@@ -1,0 +1,22 @@
+LIBRARY HookProxy
+EXPORTS
+    InitData
+    CheckSocks5
+    SetProxy
+    StopProxy
+    GetProcessFlow
+    AddFilterExeName
+    FilterProcessNet
+    FixNet
+    EmptyData
+    HpxInstallDriverW
+    HpxUninstallDriverW
+    HpxDriverStatusW
+    HpxSetUdpBackMode
+    HpxSetGlobal
+    HpxUdpPreTargetA
+    HpxDiagW
+    HpxGetLogA
+    HpxQueryPidFlowA
+    HpxMakeKeyA
+    HpxEnumProcA
