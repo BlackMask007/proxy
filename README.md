@@ -4,13 +4,12 @@
 > 提供 GUI 手动测试台(驱动安装/卸载、按进程代理、启停、状态/流量),
 > 以 SOCKS5 上游节点 `10.10.10.254:1081` 跑通验证(3 连 PASS,见 evidence\)。
 >
-> 参考物:`E:\hookproxy\HookProxy.dll`(原厂二进制,只读)与 `E:\hooksocks`
+> 参考物:`E:\hooksocks\unpack\HookProxy_unpacked.dll`(原厂二进制脱壳件,逆向分析基准)与 `E:\hooksocks`
 > (其他会话的逆向/实现记录,**只读参考**;本工程未改动其任何文件)。
 
 ## 目录
 
 ```
-HookProxy.dll          原厂二进制(用户放置,只读参考物)
 build.cmd              一键构建(drv/user/nul)
 sign.cmd               测试签名(本机证书库,J3JTest2020 发布者,VM 已信任)
 src\common\hpx_proto.h 驱动↔引擎共享协议(原厂 IOCTL 契约 + 本项目命令集)
@@ -24,8 +23,10 @@ build\                 构建产物(HpxDrv64.sys / user\HookProxy.dll,HpxGui.exe
 docs\DESIGN.md         设计与契约文档
 tools\run_e2e.bat      VM 内 E2E 一键脚本(含防陈旧部署)
 tools\deploy_vm.ps1    VM 部署(stop→替换→MD5)
-evidence\              验证证据(E2E 输出、relay.log、截图、部署 MD5)
+docs\REPORT.md         测试过程报告
 ```
+
+(历史验证留证 `evidence\` 目录已随"只保留代码与技术文档"清理,结论固化于本文。)
 
 ## 构建
 
@@ -322,6 +323,10 @@ E2E 回归全绿(e2e_notify.txt)。
   `NdisGetDataBuffer` 整包连续化(线性越界读曾致载荷乱码)。
 
 ## 已知环境事项(诚实边界)
+
+> 说明:文中 `evidence\*` 为历史测试留证路径,2026-10-18 按"只保留代码与技术文档"
+> 清理后不再随附;各项结论已固化在本文,复现脚本见 `tools\`,结果可用其重生成。
+> 测试过程报告见 `docs\REPORT.md`。
 
 - **长时运行"网络栈冻结"——根因已定位并修复(2026-10-13 夜)**:
   1. **主根因 = `DatagramClassify` 同锁嵌套 acquire**:exempt 判定持
