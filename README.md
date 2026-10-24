@@ -378,6 +378,15 @@ E2E 回归全绿(e2e_notify.txt)。
   持有 3s 的池化连接在 AddFilterExeName 瞬间被收编);②**引擎自动线程每 10s
   清扫**(`SweepStrayTcp`):受代理进程的已建立 TCP 连接中,凡对端为公网且不经
   中继泵(泵侧对端=127/8,引擎 accept 实证)者一律 DELETE_TCB,应用自动重连即回
+- **间隔掉线(2026-10-24)根因与修复**:此前驱动只记录"最后一次握手进程"的 PID,
+  任一引擎/探针实例关闭设备就把 relayPid 清零,随后 `if (g_RelayPid == 0) goto permit`
+  使后续连接直接放行——表现就是"刚连接时上下行正常,过段时间代理掉成直连";
+  实测第 241 秒由失败探针退出触发,裸节点 SOCKS 对照 20 分钟全程正常,故排除节点。
+  修复:改为**存活中继登记表**——StartRelay 成功监听才 `HPX_CTRL_RELAY_UP`,
+  StopRelay/设备关闭注销,**只有存活表为空才放行直连**;握手不再提前占位。
+  另:`HpxDiagW` 允许未 InitData 的独立诊断调用(自动 OpenDevice),并新增 `en=` 输出。
+  永久回归:`HpxProbe lifecycle` = RESULT: PASS(同口子实例失败退出后
+  `relayPid` 保持不变,最后一个中继停止后才归零)。
   代理路径;局域网/基础设施目标直连合法一并豁免;③SEH 兜底,清扫故障绝不拖垮
   引擎。实测:sweep 面包屑(begin/tbl ok/done)每 10s 稳定输出、15-19 行连接表
   判定正确、fail-open 泵连接被正确豁免;三层合围后"IP 查询显示未代理 IP"类现象

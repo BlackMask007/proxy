@@ -679,13 +679,63 @@ static int CmdAuto(const char* node, int nport, const char* tcpTgt, int tcpPort)
     return g_pass ? 0 : 1;
 }
 
+static int RunLifecycle(void)
+{
+    wchar_t selfPath[MAX_PATH], diag[4096], pat[96];
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    DWORD parentPid = GetCurrentProcessId();
+    int ok1, ok2, ok3;
+
+    if (LoadEngine() != 0) return 2;
+    if (!pInitData(28018, 28019, 0)) {
+        Emit("LIFE-INIT FAIL");
+        Emit("RESULT: FAIL");
+        return 1;
+    }
+    Emit("LIFE-UP pid=%lu", parentPid);
+
+    GetModuleFileNameW(NULL, selfPath, MAX_PATH);
+    memset(&si, 0, sizeof(si)); si.cb = sizeof(si);
+    memset(&pi, 0, sizeof(pi));
+    {
+        char cmd[MAX_PATH * 2];
+        _snprintf_s(cmd, sizeof(cmd), _TRUNCATE, "\"%ls\" relay-fail 28018", selfPath);
+        if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+            Emit("LIFE-SPAWN FAIL gle=%lu", GetLastError());
+            pEmptyData();
+            Emit("RESULT: FAIL");
+            return 1;
+        }
+    }
+    WaitForSingleObject(pi.hProcess, 15000);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    memset(diag, 0, sizeof(diag));
+    if (pDiag && pDiag(diag, 4096)) Emit("LIFE-AFTER-FAIL %ls", diag);
+    _snwprintf_s(pat, 96, _TRUNCATE, L"relayPid=%lu en=1", parentPid);
+    ok1 = (wcsstr(diag, pat) != NULL);
+    Verdict("AFTER-FAIL", ok1, "relayPid preserved after failed probe exit");
+
+    pEmptyData();
+    memset(diag, 0, sizeof(diag));
+    if (pDiag && pDiag(diag, 4096)) Emit("LIFE-AFTER-STOP %ls", diag);
+    ok2 = (wcsstr(diag, L"relayPid=0 en=0") != NULL);
+    Verdict("AFTER-STOP", ok2, "reset when last relay stops");
+
+    ok3 = ok1 && ok2;
+    Emit("RESULT: %s", ok3 ? "PASS" : "FAIL");
+    return ok3 ? 0 : 1;
+}
+
 static void PrintUsage(void)
 {
     printf("HpxProbe e2e [--node ip:port] [--user u] [--pass p] [--tcp self|ip:port] [--udp ip:port] [--back 0|1|2|3]\n");
     printf("HpxProbe auto [--node ip:port] [--tcp ip:port]   (鏄犲儚鍚嶈嚜鍔ㄧ櫥璁伴瞾妫掓€ч獙璇?\n");
     printf("HpxProbe gen <outFile> [--tcp self|ip:port] [--udp ip:port]\n");
-    printf("HpxProbe drv install|uninstall\n");
-    printf("HpxProbe wfp\n");
+    printf("HpxProbe lifecycle (relayPid 存活登记回归:同口子实例失败退出不清场)\n");
+    printf("HpxProbe relay-fail [port]\n");
 }
 
 int main(int argc, char** argv)
@@ -831,6 +881,19 @@ int main(int argc, char** argv)
             Verdict("DRV-UNINSTALL", pUn && pUn(), "");
         }
         if (pSt && pSt(st, 256)) Emit("DRIVER %ls", st);
+        rc = 0;
+    } else if (strcmp(argv[1], "lifecycle") == 0) {
+        rc = RunLifecycle();
+    } else if (strcmp(argv[1], "relay-fail") == 0) {
+        int port = (argc >= 3) ? atoi(argv[2]) : 28018;
+        if (LoadEngine() != 0) return 2;
+        Emit("RELAY-FAIL-INIT pid=%lu", GetCurrentProcessId());
+        if (!pInitData(port, port + 1, 0)) {
+            Emit("RELAY-FAIL-EXPECTED (bind conflict, exits without touching relay)");
+            return 1;
+        }
+        Emit("RELAY-FAIL-UNEXPECTED-SUCCESS");
+        pEmptyData();
         rc = 0;
     } else if (strcmp(argv[1], "wfp") == 0 || strcmp(argv[1], "hold") == 0) {
         if (LoadEngine() == 0) {

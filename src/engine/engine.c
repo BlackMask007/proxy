@@ -1703,6 +1703,7 @@ static int StartRelay(void)
         }
         LeaveCriticalSection(&g_cs);
     }
+    CtrlCmd(HPX_CTRL_RELAY_UP, (ULONG)GetCurrentProcessId(), NULL, 0);  /* 监听就绪后才登记为存活中继 */
     AutoScanOnce();                 /* 鍚姩鍗崇櫥璁扮櫧鍚嶅崟鐜版湁杩涚▼,涓嶇瓑棣栦釜杞 */
     LogF("relay: started tcp=%d udp=%d backMode=%d", g_tcpPort, g_udpPort, g_udpBackMode);
     return 0;
@@ -1736,6 +1737,7 @@ static void StopRelay(void)
         }
         LeaveCriticalSection(&g_locCs);
     }
+    CtrlCmd(HPX_CTRL_RELAY_DOWN, (ULONG)GetCurrentProcessId(), NULL, 0); /* 注销本实例;不影响其他在运中继 */
     LogF("relay: stopped");
 }
 
@@ -2179,6 +2181,7 @@ BOOL WINAPI HpxDiagW(wchar_t* buf, int cch)
 {
     ULONG cls[19], udp[9], audit[8], site[8];
     DWORD br = 0;
+    if (g_dev == INVALID_HANDLE_VALUE) OpenDevice();   /* 允许未 InitData 的独立诊断调用 */
     memset(cls, 0, sizeof(cls));
     memset(udp, 0, sizeof(udp));
     memset(audit, 0, sizeof(audit));
@@ -2188,12 +2191,12 @@ BOOL WINAPI HpxDiagW(wchar_t* buf, int cch)
     CtrlCmd(HPX_CTRL_AUDIT, 0, audit, sizeof(audit));
     CtrlCmd(HPX_CTRL_DIAG, 0, site, sizeof(site));
     _snwprintf_s(buf, cch, _TRUNCATE,
-        L"wfpSt=0x%08X bound=%lu step=%lu | cls=%lu pidHit=%lu rewrite=%lu claim=%lu v6blk=%lu quicblk=%lu imgRules=%lu imgHit=%lu | dgHit=%lu dgRw=%lu injOk=%lu injFail=%lu injSt=0x%08X injTag=%lu backRw=%lu exempt=%lu dgPermit=%lu | totalKB=%lu/%lu | ioctl=%lu denied=%lu relayPid=%lu",
+        L"wfpSt=0x%08X bound=%lu step=%lu | cls=%lu pidHit=%lu rewrite=%lu claim=%lu v6blk=%lu quicblk=%lu imgRules=%lu imgHit=%lu | dgHit=%lu dgRw=%lu injOk=%lu injFail=%lu injSt=0x%08X injTag=%lu backRw=%lu exempt=%lu dgPermit=%lu | totalKB=%lu/%lu | ioctl=%lu denied=%lu relayPid=%lu en=%lu",
         site[5], site[6], site[7],
         cls[1], cls[2], cls[3], cls[6], cls[12], cls[18], cls[13], cls[14],
         udp[1], udp[2], audit[7], udp[3], udp[8], cls[17], udp[5], udp[6], udp[7],
         cls[15], cls[16],
-        audit[1], audit[2], audit[5]);
+        audit[1], audit[2], audit[5], audit[6]);
     (void)br;
     return 1;
 }

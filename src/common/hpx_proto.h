@@ -86,6 +86,8 @@ typedef struct _HPX_HANDSHAKE {
 #define HPX_CTRL_SET_GLOBAL     12  /* param=0/1:全局模式——代理所有进程(排除中继自身;私网 LAN 例外直连) */  /* param=绔彛 */
 #define HPX_CTRL_CLEAR_LAN      13  /* param=0:清空局域网网段表 */
 #define HPX_CTRL_SET_LAN        14  /* buf=HPX_SET_LAN:局域网网段表(精确判定,访问局域网一律不代理) */
+#define HPX_CTRL_RELAY_UP       15  /* param=PID:中继监听已就绪,登记为可承接重定向的存活中继 */
+#define HPX_CTRL_RELAY_DOWN     16  /* param=PID:中继停止监听,注销;仅当存活表为空才放行直连 */
 #define HPX_CTRL_UDP_DIAG       96  /* param=0:UDP 鏁版嵁闈㈣鏁?鍑哄弬 32B) */
 #define HPX_CTRL_DIAG           97  /* param=0:WFP 娉ㄥ唽鐜板満(鍑哄弬 32B) */
 #define HPX_CTRL_CLS_DIAG       98  /* param=0:鍒嗙被/鏂偣璁℃暟(鍑哄弬 80B) */

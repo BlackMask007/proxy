@@ -60,6 +60,13 @@ static ULONG            g_WfpMode              = 0;   /* 冻结二分:bit0=跳�
 static BOOLEAN          g_Enabled              = FALSE;
 static volatile LONG    g_RelayPid             = 0;
 
+/* 存活中继登记表:StartRelay 成功监听后 HPX_CTRL_RELAY_UP 登记,
+ * StopRelay/设备关闭注销。转发是否放行只看此表是否为空,
+ * 不再被"最后一次握手进程退出"误伤(2026-10-18 间隔掉线根因)。 */
+#define HPX_MAX_RELAYS 8
+static ULONG            g_RelayPids[HPX_MAX_RELAYS];
+static ULONG            g_RelayCount = 0;
+
 static USHORT           g_RelayPortTcp         = 2018;   /* 涓绘満搴?*/
 static USHORT           g_RelayPortUdp         = 2019;   /* 涓绘満搴?*/
 
@@ -330,6 +337,51 @@ static BOOLEAN HpxIsLanV4(ULONG ipAny)
     if (a == 169 && b == 254) return TRUE;
     return FALSE;
 }
+
+/* 存活中继登记/注销:g_RelayPid 始终指向表尾一个存活中继;
+ * 只有表为空才允许直连(否则继续重定向到任一存活中继口)。 */
+static void HpxRelayUp(ULONG pid)
+{
+    KIRQL irql;
+    ULONG i;
+    KeAcquireSpinLock(&g_TableLock, &irql);
+    for (i = 0; i < g_RelayCount; i++) {
+        if (g_RelayPids[i] == pid) {
+            if (i + 1 < g_RelayCount)
+                RtlMoveMemory(&g_RelayPids[i], &g_RelayPids[i + 1],
+                              (g_RelayCount - i - 1) * sizeof(ULONG));
+            g_RelayCount--;
+            break;
+        }
+    }
+    if (g_RelayCount < HPX_MAX_RELAYS) {
+        g_RelayPids[g_RelayCount++] = pid;
+    } else {
+        RtlMoveMemory(g_RelayPids, g_RelayPids + 1, (HPX_MAX_RELAYS - 1) * sizeof(ULONG));
+        g_RelayPids[HPX_MAX_RELAYS - 1] = pid;
+    }
+    g_RelayPid = (LONG)pid;
+    KeReleaseSpinLock(&g_TableLock, irql);
+}
+
+static void HpxRelayDown(ULONG pid)
+{
+    KIRQL irql;
+    ULONG i;
+    KeAcquireSpinLock(&g_TableLock, &irql);
+    for (i = 0; i < g_RelayCount; i++) {
+        if (g_RelayPids[i] == pid) {
+            if (i + 1 < g_RelayCount)
+                RtlMoveMemory(&g_RelayPids[i], &g_RelayPids[i + 1],
+                              (g_RelayCount - i - 1) * sizeof(ULONG));
+            g_RelayCount--;
+            break;
+        }
+    }
+    g_RelayPid = g_RelayCount ? (LONG)g_RelayPids[g_RelayCount - 1] : 0;
+    KeReleaseSpinLock(&g_TableLock, irql);
+}
+
 
 /* 是否接管该进程:中继自身永不代理;全局模式=其余全部;否则 PID 登记或映像名规则命中 */
 static BOOLEAN HpxShouldProxy(const FWPS_INCOMING_METADATA_VALUES0* md,
@@ -971,10 +1023,9 @@ void RedirectClassify(
         HPX_FLOW* f;
         BOOLEAN alreadyRelay, oursBefore;
 
-        /* 涓户鎵挎帴鏂瑰瓨娲婚槻鎶?relay 杩涚▼娑堜骸鍚?g_RelayPid 闅忓叾鍙ユ焺鍏抽棴娓呴浂)
-         * 蹇呴』鍋滄閲嶅畾鍚?鍚﹀垯杩炴帴鏀瑰啓鍒版棤浜虹洃鍚殑涓户鍙?鍙犲姞 24H2
-         * "閲嶅畾鍚戝鎺ュ瓧鏀跺寘"绨胯璺緞浼氭寕姝荤綉缁滄爤(瀹炶瘉鏁欒)銆?         * 娉?姝ゅ涓嶅緱璋冪敤 PsLookupProcessByProcessId(classify 杩愯浜?DISPATCH,
-         * 璇?API 闄?IRQL<=APC);杩涚▼閫€鍑哄繀瑙﹀彂 IRP_MJ_CLOSE 娓呯櫥璁?璇箟瓒冲銆?*/
+        /* 无存活中继才放行直连:g_RelayPid 来自"存活中继登记表"
+         * (StartRelay 成功监听才 RELAY_UP,StopRelay/Close 注销),
+         * 任一其他中继实例退出不再误伤在运中继(2026-10-18 间隔掉线修复)。 */
         if (g_RelayPid == 0) goto permit;
 
         st = FwpsAcquireClassifyHandle(classifyContext, 0, &classifyHandle);
@@ -1230,7 +1281,8 @@ static NTSTATUS IoctlHandshake(PVOID buf, ULONG inLen, ULONG outLen, ULONG_PTR* 
         return STATUS_INVALID_PARAMETER;
     if (outLen < sizeof(ULONG)) return STATUS_BUFFER_TOO_SMALL;
     if (!g_WfpBound) WfpStartupAsync();
-    InterlockedExchange(&g_RelayPid, (LONG)(ULONG_PTR)PsGetCurrentProcessId());
+    /* relayPid 不再由握手提前占位:仅 StartRelay 成功监听后 RELAY_UP 才登记,
+     * 避免"探测实例握手失败→退出"把在运中继的转发资格一并带走。 */
     *(ULONG*)buf = HPX_HANDSHAKE_SIZE;
     *info = sizeof(ULONG);
     return STATUS_SUCCESS;
@@ -1409,6 +1461,12 @@ static NTSTATUS IoctlControl(PVOID buf, ULONG inLen, ULONG outLen, ULONG_PTR* in
         KeReleaseSpinLock(&g_TableLock, irql);
         return STATUS_SUCCESS;
     }
+    case HPX_CTRL_RELAY_UP:
+        HpxRelayUp((ULONG)(ULONG_PTR)PsGetCurrentProcessId());
+        return STATUS_SUCCESS;
+    case HPX_CTRL_RELAY_DOWN:
+        HpxRelayDown((ULONG)(ULONG_PTR)PsGetCurrentProcessId());
+        return STATUS_SUCCESS;
     case HPX_CTRL_UDP_DIAG: {
         ULONG* out = (ULONG*)buf;
         if (outLen < 9 * sizeof(ULONG)) return STATUS_BUFFER_TOO_SMALL;
@@ -1741,8 +1799,8 @@ static NTSTATUS HpxCreateClose(PDEVICE_OBJECT dev, PIRP irp)
     PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(irp);
     UNREFERENCED_PARAMETER(dev);
     if (sp->MajorFunction == IRP_MJ_CLOSE) {
-        /* 鍙竻鑷繁鐨勪腑缁?PID 鐧昏 */
-        InterlockedCompareExchange(&g_RelayPid, 0, (LONG)(ULONG_PTR)PsGetCurrentProcessId());
+        /* 设备关闭:按 PID 注销存活中继;仅当全部中继退出才允许直连 */
+        HpxRelayDown((ULONG)(ULONG_PTR)PsGetCurrentProcessId());
     }
     irp->IoStatus.Status = STATUS_SUCCESS;
     irp->IoStatus.Information = 0;
