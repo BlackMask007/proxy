@@ -391,3 +391,8 @@ E2E 回归全绿(e2e_notify.txt)。
   另:`HpxDiagW` 允许未 InitData 的独立诊断调用(自动 OpenDevice),并新增 `en=` 输出。
   永久回归:`HpxProbe lifecycle` = RESULT: PASS(同口子实例失败退出后
   `relayPid` 保持不变,最后一个中继停止后才归零)。
+- **驱动安装失败(2026-10-24)**:根因不是签名/WDAC,而是服务被禁用或已标记删除,
+  `StartService` 返回 1058(ERROR_SERVICE_DISABLED),旧安装路径直接失败。
+  修复 `HpxInstallDriverW`:存在服务时先恢复为 DEMAND_START;若遇禁用或标记删除,
+  先删除旧服务再按当前 .sys 路径重建并启动。实测 `sc config start= disabled` 与
+  `sc delete` 两种状态安装后均为 RUNNING,文件哈希与签名不变。

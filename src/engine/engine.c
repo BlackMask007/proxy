@@ -289,14 +289,37 @@ BOOL WINAPI HpxInstallDriverW(const wchar_t* sysPath)
         }
         LogF("install: service created %ls", path);
     } else {
-        /* 鎸囧悜褰撳墠璺緞(闃叉棫璺緞娈嬬暀) */
-        ChangeServiceConfigW(svc, SERVICE_NO_CHANGE, SERVICE_NO_CHANGE, SERVICE_NO_CHANGE,
+        /* 指向当前路径(防旧路径残留),并把被手动禁用恢复为按需启动 */
+        ChangeServiceConfigW(svc, SERVICE_DEMAND_START, SERVICE_NO_CHANGE, SERVICE_NO_CHANGE,
                              path, NULL, NULL, NULL, NULL, NULL, NULL);
     }
 
     if (!StartServiceW(svc, 0, NULL)) {
         DWORD gle = GetLastError();
-        if (gle != ERROR_SERVICE_ALREADY_RUNNING) {
+        if (gle == ERROR_SERVICE_DISABLED || gle == ERROR_SERVICE_MARKED_FOR_DELETE) {
+            /* 禁用/标记删除不能靠 StartService 硬拉:删除后按当前路径重建 */
+            LogF("install: recover disabled/deleted state gle=%lu", gle);
+            if (svc) {
+                DeleteService(svc);       /* ERROR_SERVICE_MARKED_FOR_DELETE 可忽略 */
+                CloseServiceHandle(svc);
+                svc = NULL;
+            }
+            svc = CreateServiceW(scm, HPX_SERVICE_NAME_W, HPX_SERVICE_NAME_W,
+                                 SERVICE_ALL_ACCESS, SERVICE_KERNEL_DRIVER, SERVICE_DEMAND_START,
+                                 SERVICE_ERROR_NORMAL, path, NULL, NULL, L"Tcpip\0BFE", NULL, NULL);
+            if (!svc) {
+                LogF("install: recreate service gle=%lu", GetLastError());
+                CloseServiceHandle(scm);
+                return FALSE;
+            }
+            LogF("install: service recreated %ls", path);
+            if (!StartServiceW(svc, 0, NULL)) {
+                LogF("install: StartService after recreate gle=%lu", GetLastError());
+                CloseServiceHandle(svc);
+                CloseServiceHandle(scm);
+                return FALSE;
+            }
+        } else if (gle != ERROR_SERVICE_ALREADY_RUNNING) {
             LogF("install: StartService gle=%lu", gle);
             CloseServiceHandle(svc);
             CloseServiceHandle(scm);
