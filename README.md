@@ -396,3 +396,11 @@ E2E 回归全绿(e2e_notify.txt)。
   修复 `HpxInstallDriverW`:存在服务时先恢复为 DEMAND_START;若遇禁用或标记删除,
   先删除旧服务再按当前 .sys 路径重建并启动。实测 `sc config start= disabled` 与
   `sc delete` 两种状态安装后均为 RUNNING,文件哈希与签名不变。
+- **卸载卡顿/随后安装失败(2026-10-26)**:根因是 GUI 持有设备句柄时直接同步停止驱动,
+  SCM 长期停在 `STOP_PENDING`,删除中的服务又被置为 DISABLED;旧卸载仍返回成功。
+  修复:卸载先 `EmptyData`/关闭本进程设备句柄,确认 STOPPED 后再 DeleteService;
+  安装处理 STOP_PENDING 并对 `ERROR_SERVICE_MARKED_FOR_DELETE` 做限时重建重试;
+  `ChangeServiceConfigW` 正确恢复 DEMAND_START;GUI 驱动操作移到工作线程,
+  期间暂停自动诊断以防重新打开设备。永久回归 `HpxProbe drv cycle`:
+  中继与设备句柄存活时卸载并立即重装;连续 5 次全部通过,卸载 15-235ms。
+  GUI 实点启动→卸载→重装通过,卸载期间 UI `SendMessageTimeout`=True。

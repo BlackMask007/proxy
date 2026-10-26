@@ -252,7 +252,37 @@ static BOOL ServiceExists(const wchar_t* name, DWORD* state)
     return TRUE;
 }
 
-/* 瀹夎骞跺惎鍔ㄩ┍鍔ㄦ湇鍔?sysPath 涓虹┖鍒欑敤 exe 鍚岀洰褰?HPX_DRIVER_FILE */
+/* 驱动停止前必须释放本进程的设备引用;打开的设备句柄会让 SCM 停在 STOP_PENDING。 */
+static void HpxReleaseDriverDevice(void)
+{
+    if (g_init) EmptyData();
+    if (g_dev != INVALID_HANDLE_VALUE) {
+        CloseHandle(g_dev);
+        g_dev = INVALID_HANDLE_VALUE;
+    }
+}
+
+static SC_HANDLE HpxCreateDriverService(SC_HANDLE scm, const wchar_t* path)
+{
+    return CreateServiceW(scm, HPX_SERVICE_NAME_W, HPX_SERVICE_NAME_W,
+                          SERVICE_ALL_ACCESS, SERVICE_KERNEL_DRIVER, SERVICE_DEMAND_START,
+                          SERVICE_ERROR_NORMAL, path, NULL, NULL, L"Tcpip\0BFE", NULL, NULL);
+}
+
+static SC_HANDLE HpxCreateDriverServiceWait(SC_HANDLE scm, const wchar_t* path, DWORD timeoutMs)
+{
+    DWORD elapsed;
+    for (elapsed = 0; elapsed < timeoutMs; elapsed += 100) {
+        SC_HANDLE svc = HpxCreateDriverService(scm, path);
+        if (svc) return svc;
+        if (GetLastError() != ERROR_SERVICE_MARKED_FOR_DELETE) return NULL;
+        Sleep(100);
+    }
+    return NULL;
+}
+
+
+/* 安装并启动;sysPath 为空则使用 exe 同目录 HPX_DRIVER_FILE。 */
 BOOL WINAPI HpxInstallDriverW(const wchar_t* sysPath)
 {
     wchar_t path[MAX_PATH];
@@ -278,35 +308,47 @@ BOOL WINAPI HpxInstallDriverW(const wchar_t* sysPath)
     if (!scm) { LogF("install: OpenSCManager gle=%lu", GetLastError()); return FALSE; }
 
     svc = OpenServiceW(scm, HPX_SERVICE_NAME_W, SERVICE_ALL_ACCESS);
-    if (!svc) {
-        svc = CreateServiceW(scm, HPX_SERVICE_NAME_W, HPX_SERVICE_NAME_W,
-                             SERVICE_ALL_ACCESS, SERVICE_KERNEL_DRIVER, SERVICE_DEMAND_START,
-                             SERVICE_ERROR_NORMAL, path, NULL, NULL, L"Tcpip\0BFE", NULL, NULL);
+    if (svc) {
+        SERVICE_STATUS ss;
+        if (QueryServiceStatus(svc, &ss) && ss.dwCurrentState == SERVICE_STOP_PENDING) {
+            int i;
+            LogF("install: waiting for prior stop");
+            HpxReleaseDriverDevice();
+            for (i = 0; i < 100; i++) {
+                if (!QueryServiceStatus(svc, &ss)) break;
+                if (ss.dwCurrentState != SERVICE_STOP_PENDING) break;
+                Sleep(100);
+            }
+            if (ss.dwCurrentState == SERVICE_STOP_PENDING) {
+                LogF("install: prior stop still pending");
+                CloseServiceHandle(svc);
+                CloseServiceHandle(scm);
+                return FALSE;
+            }
+        }
+        if (!ChangeServiceConfigW(svc, SERVICE_NO_CHANGE, SERVICE_DEMAND_START, SERVICE_NO_CHANGE,
+                                  path, NULL, NULL, NULL, NULL, NULL, NULL)) {
+            LogF("install: ChangeServiceConfig gle=%lu", GetLastError());
+        }
+    } else {
+        svc = HpxCreateDriverServiceWait(scm, path, 10000);
         if (!svc) {
             LogF("install: CreateService gle=%lu", GetLastError());
             CloseServiceHandle(scm);
             return FALSE;
         }
         LogF("install: service created %ls", path);
-    } else {
-        /* 指向当前路径(防旧路径残留),并把被手动禁用恢复为按需启动 */
-        ChangeServiceConfigW(svc, SERVICE_DEMAND_START, SERVICE_NO_CHANGE, SERVICE_NO_CHANGE,
-                             path, NULL, NULL, NULL, NULL, NULL, NULL);
     }
 
     if (!StartServiceW(svc, 0, NULL)) {
         DWORD gle = GetLastError();
         if (gle == ERROR_SERVICE_DISABLED || gle == ERROR_SERVICE_MARKED_FOR_DELETE) {
-            /* 禁用/标记删除不能靠 StartService 硬拉:删除后按当前路径重建 */
             LogF("install: recover disabled/deleted state gle=%lu", gle);
-            if (svc) {
-                DeleteService(svc);       /* ERROR_SERVICE_MARKED_FOR_DELETE 可忽略 */
-                CloseServiceHandle(svc);
-                svc = NULL;
-            }
-            svc = CreateServiceW(scm, HPX_SERVICE_NAME_W, HPX_SERVICE_NAME_W,
-                                 SERVICE_ALL_ACCESS, SERVICE_KERNEL_DRIVER, SERVICE_DEMAND_START,
-                                 SERVICE_ERROR_NORMAL, path, NULL, NULL, L"Tcpip\0BFE", NULL, NULL);
+            DeleteService(svc);
+            CloseServiceHandle(svc);
+            svc = NULL;
+            HpxReleaseDriverDevice();
+            svc = HpxCreateDriverServiceWait(scm, path, 10000);
             if (!svc) {
                 LogF("install: recreate service gle=%lu", GetLastError());
                 CloseServiceHandle(scm);
@@ -314,10 +356,13 @@ BOOL WINAPI HpxInstallDriverW(const wchar_t* sysPath)
             }
             LogF("install: service recreated %ls", path);
             if (!StartServiceW(svc, 0, NULL)) {
-                LogF("install: StartService after recreate gle=%lu", GetLastError());
-                CloseServiceHandle(svc);
-                CloseServiceHandle(scm);
-                return FALSE;
+                gle = GetLastError();
+                if (gle != ERROR_SERVICE_ALREADY_RUNNING) {
+                    LogF("install: StartService after recreate gle=%lu", gle);
+                    CloseServiceHandle(svc);
+                    CloseServiceHandle(scm);
+                    return FALSE;
+                }
             }
         } else if (gle != ERROR_SERVICE_ALREADY_RUNNING) {
             LogF("install: StartService gle=%lu", gle);
@@ -326,7 +371,6 @@ BOOL WINAPI HpxInstallDriverW(const wchar_t* sysPath)
             return FALSE;
         }
     }
-    /* 绛?RUNNING */
     {
         int i;
         for (i = 0; i < 50; i++) {
@@ -348,18 +392,42 @@ BOOL WINAPI HpxUninstallDriverW(void)
 {
     SC_HANDLE scm, svc;
     SERVICE_STATUS ss;
+    DWORD state = 0;
     int i;
+
+    /* 先停中继并关闭 g_dev;否则本进程自己就能让驱动一直 STOP_PENDING。 */
+    HpxReleaseDriverDevice();
 
     scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_ALL_ACCESS);
     if (!scm) return FALSE;
     svc = OpenServiceW(scm, HPX_SERVICE_NAME_W, SERVICE_ALL_ACCESS);
-    if (!svc) { CloseServiceHandle(scm); return TRUE; }
+    if (!svc) {
+        DWORD gle = GetLastError();
+        CloseServiceHandle(scm);
+        return gle == ERROR_SERVICE_NOT_FOUND;
+    }
 
-    ControlService(svc, SERVICE_CONTROL_STOP, &ss);
-    for (i = 0; i < 100; i++) {           /* 鏈€澶?10s 绛夊仠瀹?闃?pending-delete) */
+    memset(&ss, 0, sizeof(ss));
+    if (!ControlService(svc, SERVICE_CONTROL_STOP, &ss)) {
+        DWORD gle = GetLastError();
+        if (gle != ERROR_SERVICE_NOT_ACTIVE && gle != ERROR_SERVICE_CANNOT_ACCEPT_CTRL) {
+            LogF("uninstall: ControlService gle=%lu", gle);
+            CloseServiceHandle(svc);
+            CloseServiceHandle(scm);
+            return FALSE;
+        }
+    }
+    for (i = 0; i < 100; i++) {
         if (!QueryServiceStatus(svc, &ss)) break;
-        if (ss.dwCurrentState == SERVICE_STOPPED) break;
+        state = ss.dwCurrentState;
+        if (state == SERVICE_STOPPED) break;
         Sleep(100);
+    }
+    if (state != SERVICE_STOPPED) {
+        LogF("uninstall: stop timeout state=%lu", state);
+        CloseServiceHandle(svc);
+        CloseServiceHandle(scm);
+        return FALSE;
     }
     if (!DeleteService(svc)) {
         DWORD gle = GetLastError();

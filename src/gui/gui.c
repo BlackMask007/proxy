@@ -41,6 +41,8 @@ enum {
     IDC_TIMER = 1
 };
 
+#define WM_HPX_DRIVER_DONE (WM_APP + 1)
+
 /* ---------- 引擎函数指针 ---------- */
 static HMODULE g_dll;
 typedef BOOL (WINAPI *PFN_InitData)(int, int, BOOLEAN);
@@ -81,6 +83,8 @@ static PFN_AddFilterExeName pAddFilterExeName;
 static int g_logIdx = 0;
 static HWND g_hLog, g_hFlows, g_hStDrv, g_hStEngine, g_hStDiag, g_hStTotal;
 static HWND g_hEdNode, g_hEdPort, g_hEdUser, g_hEdPass, g_hEdPid, g_hCbProcs, g_hCbBack;
+static HWND g_hwnd;
+static volatile LONG g_driverBusy = 0;
 
 static void SetText(HWND h, const wchar_t* s) { SetWindowTextW(h, s); }
 
@@ -401,28 +405,42 @@ static int ResolveSelectedImage(char* image, int cap)
 }
 
 /* ---------- 动作 ---------- */
-static void DoInstall(void)
+static void SetDriverControls(BOOL enable)
 {
-    wchar_t st[256];
-    if (!pInstall) return;
-    SetText(g_hStDrv, L"状态: 安装中…");
-    if (pInstall(NULL)) SetText(g_hStDrv, L"状态: 驱动已安装并运行");
-    else SetText(g_hStDrv, L"状态: 安装失败(查看日志)");
-    if (pDrvStatus && pDrvStatus(st, 256)) {
-        wchar_t line[320];
-        _snwprintf_s(line, 320, _TRUNCATE, L"状态: %s", st);
-        SetText(g_hStDrv, line);
-    }
-    PullLog();
+    EnableWindow(GetDlgItem(g_hwnd, IDC_BTN_INSTALL), enable);
+    EnableWindow(GetDlgItem(g_hwnd, IDC_BTN_UNINSTALL), enable);
+    EnableWindow(GetDlgItem(g_hwnd, IDC_BTN_DRVSTATUS), enable);
+    EnableWindow(GetDlgItem(g_hwnd, IDC_BTN_START), enable);
+    EnableWindow(GetDlgItem(g_hwnd, IDC_BTN_STOP), enable);
 }
 
-static void DoUninstall(void)
+static DWORD WINAPI DriverActionThread(LPVOID param)
 {
-    if (!pUninstall) return;
-    if (pUninstall()) SetText(g_hStDrv, L"状态: 驱动已停止并删除");
-    else SetText(g_hStDrv, L"状态: 卸载失败(查看日志)");
-    PullLog();
+    BOOL install = (BOOL)(INT_PTR)param;
+    BOOL ok = install ? pInstall(NULL) : pUninstall();
+    PostMessageW(g_hwnd, WM_HPX_DRIVER_DONE, (WPARAM)install, (LPARAM)ok);
+    return 0;
 }
+
+static void BeginDriverAction(BOOL install)
+{
+    HANDLE thread;
+    if ((install && !pInstall) || (!install && !pUninstall)) return;
+    if (InterlockedCompareExchange(&g_driverBusy, 1, 0) != 0) return;
+    SetDriverControls(FALSE);
+    SetText(g_hStDrv, install ? L"状态: 安装中…" : L"状态: 卸载中…");
+    thread = CreateThread(NULL, 0, DriverActionThread, (LPVOID)(INT_PTR)install, 0, NULL);
+    if (!thread) {
+        InterlockedExchange(&g_driverBusy, 0);
+        SetDriverControls(TRUE);
+        SetText(g_hStDrv, L"状态: 无法创建驱动操作线程");
+        return;
+    }
+    CloseHandle(thread);
+}
+
+static void DoInstall(void) { BeginDriverAction(TRUE); }
+static void DoUninstall(void) { BeginDriverAction(FALSE); }
 
 static void DoDrvStatus(void)
 {
@@ -679,6 +697,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 {
     switch (msg) {
     case WM_CREATE:
+        g_hwnd = hwnd;
         BuildUi(hwnd);
         SetTimer(hwnd, IDC_TIMER, 1000, NULL);
         FillProcesses(NULL);
@@ -686,8 +705,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
     case WM_TIMER:
         PullLog();
-        RefreshDiag();
-        RefreshFlows();
+        if (!g_driverBusy) {
+            RefreshDiag();
+            RefreshFlows();
+        }
         return 0;
     case WM_NOTIFY:
         if (((LPNMHDR)lParam)->hwndFrom == g_hFlows && ((LPNMHDR)lParam)->code == LVN_COLUMNCLICK) {
@@ -697,6 +718,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             UpdateSortIndicator();
             RefreshFlows();
         }
+        return 0;
+    case WM_HPX_DRIVER_DONE:
+        InterlockedExchange(&g_driverBusy, 0);
+        SetDriverControls(TRUE);
+        if (wParam) {
+            SetText(g_hStDrv, lParam ? L"状态: 驱动已安装并运行" : L"状态: 安装失败(查看日志)");
+        } else {
+            SetText(g_hStDrv, lParam ? L"状态: 驱动已停止并删除" : L"状态: 卸载失败(查看日志)");
+            if (lParam) SetText(g_hStEngine, L"引擎: 已停止");
+        }
+        if (lParam) DoDrvStatus();
+        PullLog();
         return 0;
     case WM_COMMAND:
         switch (LOWORD(wParam)) {

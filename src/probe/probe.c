@@ -877,11 +877,30 @@ int main(int argc, char** argv)
         pSt = (PFN_St)GetProcAddress(g_dll, "HpxDriverStatusW");
         if (strcmp(argv[2], "install") == 0) {
             Verdict("DRV-INSTALL", pInst && pInst(NULL), "");
+        } else if (strcmp(argv[2], "cycle") == 0) {
+            int upOk = pInitData(28118, 28119, 0);
+            Verdict("DRV-CYCLE-INIT", upOk, "relay and device handle open");
+            if (upOk) {
+                DWORD t0 = GetTickCount();
+                int unOk = pUn && pUn();
+                DWORD unMs = GetTickCount() - t0;
+                int inOk, stOk;
+                Emit("DRV-CYCLE-UNLOAD-MS %lu", unMs);
+                Verdict("DRV-CYCLE-UNINSTALL", unOk, "service stopped and deleted");
+                t0 = GetTickCount();
+                inOk = pInst && pInst(NULL);
+                Emit("DRV-CYCLE-INSTALL-MS %lu", GetTickCount() - t0);
+                memset(st, 0, sizeof(st));
+                stOk = pSt && pSt(st, 256) && wcsstr(st, L"state=4 device=openable") != NULL;
+                if (st[0]) Emit("DRIVER %ls", st);
+                Verdict("DRV-CYCLE-REINSTALL", inOk && stOk, "running with openable device");
+            }
+            rc = g_pass ? 0 : 1;
         } else if (strcmp(argv[2], "uninstall") == 0) {
             Verdict("DRV-UNINSTALL", pUn && pUn(), "");
         }
         if (pSt && pSt(st, 256)) Emit("DRIVER %ls", st);
-        rc = 0;
+        rc = g_pass ? 0 : 1;
     } else if (strcmp(argv[1], "lifecycle") == 0) {
         rc = RunLifecycle();
     } else if (strcmp(argv[1], "relay-fail") == 0) {
