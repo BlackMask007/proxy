@@ -14,6 +14,9 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#ifndef FD_SETSIZE
+#define FD_SETSIZE 128  /* 1 relay + 32 local targets + 64 upstream UDP flows */
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -1132,6 +1135,8 @@ typedef struct _UDP_FLOW {
     int      reported;
 } UDP_FLOW;
 static UDP_FLOW g_flows[MAX_UDP_FLOWS];
+static CRITICAL_SECTION g_udpCs;
+static volatile LONG g_udpCsReady = 0;
 
 /* ===== mode 3:鐩爣 IP 鏈湴鍖?鐩爣钀芥垚鏈満闄勫姞鍦板潃 + 缁戠洰鏍囩鐐规敹鍙? =====
  * 鏈哄埗:鐩爣 IP 鍔犱负鏈満鐜洖鎺ュ彛鐨?/32 闄勫姞鍦板潃 鈫?bind(鐩爣 ip:port) 鐨勫鎺ュ瓧
@@ -1214,6 +1219,8 @@ static void EngineLazyInit(void)
         InitializeCriticalSection(&g_cs);
     if (InterlockedCompareExchange(&g_locCsReady, 1, 0) == 0)
         InitializeCriticalSection(&g_locCs);
+    if (InterlockedCompareExchange(&g_udpCsReady, 1, 0) == 0)
+        InitializeCriticalSection(&g_udpCs);
     if (g_hStopEvent == NULL) {
         HANDLE ev = CreateEventW(NULL, TRUE, FALSE, NULL);
         InterlockedCompareExchangePointer((PVOID*)&g_hStopEvent, ev, NULL);
@@ -1446,6 +1453,31 @@ static UDP_FLOW* UdpFindFlow(const struct sockaddr_in* app, const struct sockadd
     return NULL;
 }
 
+static void UdpFlushFlow(UDP_FLOW* f)
+{
+    EnterCriticalSection(&g_udpCs);
+    if (f->up || f->down) {
+        UdpReport(f->recId, (DWORD)f->up, (DWORD)f->down);
+        f->up = f->down = 0;
+    }
+    LeaveCriticalSection(&g_udpCs);
+}
+
+static void UdpFlushAccounting(ULONG recId)
+{
+    int i;
+    for (i = 0; i < MAX_UDP_FLOWS; i++)
+        if (g_flows[i].active && g_flows[i].recId == recId) UdpFlushFlow(&g_flows[i]);
+}
+
+static void UdpAccountAdd(UDP_FLOW* f, ULONG up, ULONG down)
+{
+    EnterCriticalSection(&g_udpCs);
+    f->up += up;
+    f->down += down;
+    LeaveCriticalSection(&g_udpCs);
+}
+
 static UDP_FLOW* UdpAllocFlow(void)
 {
     int i;
@@ -1459,11 +1491,11 @@ static UDP_FLOW* UdpAllocFlow(void)
             if (g_flows[i].lastTick < g_flows[oldest].lastTick) oldest = i;
         if (now - g_flows[oldest].lastTick > 1000) {
             UDP_FLOW* f = &g_flows[oldest];
-            if (f->up || f->down)
-                UdpReport(f->recId, (DWORD)f->up, (DWORD)f->down);
+            UdpFlushFlow(f);
             UdpReport(f->recId, 0, 0);
             if (f->us != INVALID_SOCKET) closesocket(f->us);
             if (f->ctrl != INVALID_SOCKET) closesocket(f->ctrl);
+            f->us = f->ctrl = INVALID_SOCKET;
             f->active = 0;
             return f;
         }
@@ -1474,11 +1506,11 @@ static UDP_FLOW* UdpAllocFlow(void)
 static void UdpCloseFlow(UDP_FLOW* f, const char* why)
 {
     if (!f->active) return;
-    if (f->up || f->down)
-        UdpReport(f->recId, (DWORD)f->up, (DWORD)f->down);
+    UdpFlushFlow(f);
     UdpReport(f->recId, 0, 0);
     if (f->us != INVALID_SOCKET) closesocket(f->us);
     if (f->ctrl != INVALID_SOCKET) closesocket(f->ctrl);
+    f->us = f->ctrl = INVALID_SOCKET;
     LogF("udp: close %s up=%llu down=%llu", why, f->up, f->down);
     f->active = 0;
 }
@@ -1517,7 +1549,7 @@ static void UdpHandleAppDatagram(const struct sockaddr_in* from,
         {
             int uatt;
             int okAssoc = 0;
-            for (uatt = 0; uatt < 3 && !okAssoc; uatt++) {
+            for (uatt = 0; uatt < 3 && !okAssoc && !g_stop; uatt++) {
                 if (uatt) {
                     if (f->ctrl != INVALID_SOCKET) closesocket(f->ctrl);
                     f->ctrl = INVALID_SOCKET;
@@ -1530,6 +1562,7 @@ static void UdpHandleAppDatagram(const struct sockaddr_in* from,
             if (!okAssoc) {
                 LogF("udp: associate fail err=%d", WSAGetLastError());
                 if (f->ctrl != INVALID_SOCKET) closesocket(f->ctrl);
+                f->ctrl = INVALID_SOCKET;
                 f->active = 0;
                 return;
             }
@@ -1537,6 +1570,7 @@ static void UdpHandleAppDatagram(const struct sockaddr_in* from,
         f->us = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (f->us == INVALID_SOCKET) {
             closesocket(f->ctrl);
+            f->ctrl = INVALID_SOCKET;
             f->active = 0;
             return;
         }
@@ -1556,12 +1590,8 @@ static void UdpHandleAppDatagram(const struct sockaddr_in* from,
         int elen = s5_udp_encap(&f->tgt, payload, plen, encap, sizeof(encap));
         if (elen > 0 && sendto(f->us, encap, elen, 0,
                                (struct sockaddr*)&f->bnd, sizeof(f->bnd)) == elen) {
-            f->up += plen;
+            UdpAccountAdd(f, (ULONG)plen, 0);
             f->lastTick = GetTickCount();
-            if (f->up >= 1) {
-                UdpReport(f->recId, (DWORD)f->up, 0);
-                f->up = 0;
-            }
         } else {
             LogF("udp: fwd fail err=%d", WSAGetLastError());
         }
@@ -1571,6 +1601,7 @@ static void UdpHandleAppDatagram(const struct sockaddr_in* from,
 static DWORD WINAPI UdpThread(LPVOID unused)
 {
     char pkt[65536];
+    static ULONG claimFail = 0, claimIdFail = 0;
     (void)unused;
     while (!InterlockedCompareExchange(&g_stop, 0, 0)) {
         fd_set rf;
@@ -1587,13 +1618,15 @@ static DWORD WINAPI UdpThread(LPVOID unused)
         if (r < 0) break;
         if (r == 0) {
             DWORD now = GetTickCount();
-            for (i = 0; i < MAX_UDP_FLOWS; i++)
-                if (g_flows[i].active && now - g_flows[i].lastTick > 90000)
-                    UdpCloseFlow(&g_flows[i], "idle");
+            for (i = 0; i < MAX_UDP_FLOWS; i++) {
+                UDP_FLOW* f = &g_flows[i];
+                if (!f->active) continue;
+                UdpFlushFlow(f);
+                if (now - f->lastTick > 90000) UdpCloseFlow(f, "idle");
+            }
             continue;
         }
 
-        /* 娉ㄥ叆璺緞:椹卞姩鍚告敹鍖?甯﹀熬鏍?鈫?璁ら */
         if (g_udpSock != INVALID_SOCKET && FD_ISSET(g_udpSock, &rf)) {
             struct sockaddr_in from;
             int flen = sizeof(from), n;
@@ -1604,8 +1637,6 @@ static DWORD WINAPI UdpThread(LPVOID unused)
                 struct sockaddr_in tgt;
                 const char* payload = pkt;
                 int plen = n;
-                LogF("udp: in n=%d from=%08x:%u", n, from.sin_addr.s_addr, ntohs(from.sin_port));
-
                 if (n >= 12 && memcmp(pkt + n - 12, "HPXTRAIL", 8) == 0) {
                     memcpy(&flowId, pkt + n - 4, 4);
                     plen = n - 12;
@@ -1614,13 +1645,16 @@ static DWORD WINAPI UdpThread(LPVOID unused)
                 if (flowId) {
                     if (!ClaimDest(HPX_REQ_BY_ID, flowId, 0, 17, &claim) ||
                         claim.u.dst.protocol != 17) {
-                        LogF("udp: claim-by-id fail id=%u", flowId);
+                        if ((++claimIdFail & 1023) == 1)
+                            LogF("udp: claim-by-id fail id=%u count=%lu", flowId, claimIdFail);
                         continue;
                     }
                 } else if (!ClaimDest(HPX_REQ_BY_ENDPOINT,
                                       (ULONG)from.sin_port, (ULONG)from.sin_addr.s_addr, 17, &claim) ||
                            claim.u.dst.protocol != 17) {
-                    LogF("udp: claim fail from=%08x:%u", from.sin_addr.s_addr, ntohs(from.sin_port));
+                    if ((++claimFail & 1023) == 1)
+                        LogF("udp: claim fail from=%08x:%u count=%lu",
+                             from.sin_addr.s_addr, ntohs(from.sin_port), claimFail);
                     continue;
                 }
                 memset(&tgt, 0, sizeof(tgt));
@@ -1635,7 +1669,6 @@ static DWORD WINAPI UdpThread(LPVOID unused)
             }
         }
 
-        /* 鏈湴鍖栬矾寰?鐩爣濂楁帴瀛楃洿鎺ユ敹鍒板簲鐢ㄦ暟鎹姤(婧?搴旂敤绔偣) */
         for (i = 0; i < MAX_LOCTGT; i++) {
             if (!g_locTgts[i].active || g_locTgts[i].s == INVALID_SOCKET ||
                 !FD_ISSET(g_locTgts[i].s, &rf)) continue;
@@ -1662,19 +1695,30 @@ static DWORD WINAPI UdpThread(LPVOID unused)
                     struct sockaddr_in inner;
                     const void* payload;
                     int plen;
+                    if (src.sin_addr.s_addr != f->bnd.sin_addr.s_addr ||
+                        src.sin_port != f->bnd.sin_port) continue;
                     if (s5_udp_decap(rbuf, n, &inner, &payload, &plen) == 0) {
                         if (UdpDeliverToApp(f, payload, plen)) {
-                            f->down += plen;
+                            UdpAccountAdd(f, 0, (ULONG)plen);
                             f->lastTick = GetTickCount();
-                            if (1) {          /* 灏忔祦鍗虫姤:璁¤垂鍙婃椂鍙 */
-                                UdpReport(f->recId, (DWORD)f->up, (DWORD)f->down);
-                                f->up = f->down = 0;
-                            }
                         } else {
                             LogF("udp: deliver fail plen=%d", plen);
                         }
                     }
                 }
+            }
+        }
+    }
+    {
+        int i;
+        for (i = 0; i < MAX_UDP_FLOWS; i++) {
+            UDP_FLOW* f = &g_flows[i];
+            if (f->active) {
+                UdpCloseFlow(f, "stop");
+            } else {
+                if (f->us != INVALID_SOCKET) closesocket(f->us);
+                if (f->ctrl != INVALID_SOCKET) closesocket(f->ctrl);
+                f->us = f->ctrl = INVALID_SOCKET;
             }
         }
     }
@@ -1732,6 +1776,8 @@ static DWORD WINAPI EventThread(LPVOID unused)
 }
 
 /* ============================ 鐢熷懡鍛ㄦ湡 ============================ */
+static void StopRelay(void);
+
 static int StartRelay(void)
 {
     struct sockaddr_in sa;
@@ -1752,7 +1798,11 @@ static int StartRelay(void)
     }
 
     g_udpSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (g_udpSock == INVALID_SOCKET) return -1;
+    if (g_udpSock == INVALID_SOCKET) {
+        closesocket(g_tcpListen);
+        g_tcpListen = INVALID_SOCKET;
+        return -1;
+    }
     {
         int big = 1 << 20;
         setsockopt(g_udpSock, SOL_SOCKET, SO_RCVBUF, (const char*)&big, sizeof(big));
@@ -1763,6 +1813,8 @@ static int StartRelay(void)
         LogF("relay: udp bind fail port=%d err=%d", g_udpPort, WSAGetLastError());
         closesocket(g_udpSock);
         g_udpSock = INVALID_SOCKET;
+        closesocket(g_tcpListen);
+        g_tcpListen = INVALID_SOCKET;
         return -1;
     }
     ioctlsocket(g_udpSock, FIONBIO, &nb);
@@ -1772,13 +1824,22 @@ static int StartRelay(void)
         if (LocInit() != 0) LogF("relay: loc init fail(loopback LUID not found)");
     }
 
+    {
+        int i;
+        memset(g_flows, 0, sizeof(g_flows));
+        for (i = 0; i < MAX_UDP_FLOWS; i++) g_flows[i].us = g_flows[i].ctrl = INVALID_SOCKET;
+    }
     InterlockedExchange(&g_stop, 0);
-    if (g_hStopEvent) ResetEvent(g_hStopEvent);   /* 复位停止事件:残留置位会让 auto 线程的
-                                                    WaitForSingleObject 立即返回 → 500Hz 空转扫描 */
+    if (g_hStopEvent) ResetEvent(g_hStopEvent);
     g_hTcpAccept = CreateThread(NULL, 0, TcpAcceptThread, NULL, 0, NULL);
     g_hUdpThread = CreateThread(NULL, 0, UdpThread, NULL, 0, NULL);
     g_hEvtThread = CreateThread(NULL, 0, EventThread, NULL, 0, NULL);
     g_hAutoThread = CreateThread(NULL, 0, AutoRegThread, NULL, 0, NULL);
+    if (!g_hTcpAccept || !g_hUdpThread || !g_hEvtThread || !g_hAutoThread) {
+        LogF("relay: create thread failed gle=%lu", GetLastError());
+        StopRelay();
+        return -1;
+    }
     /* 映像名规则重推驱动(自愈):重启/清空后驱动侧规则仍完整,
      * 新进程自第一个 connect 起即被 classify 接管,无登记竞态窗口 */
     {
@@ -1800,22 +1861,27 @@ static int StartRelay(void)
     return 0;
 }
 
+static void JoinRelayThread(HANDLE* thread)
+{
+    if (!*thread) return;
+    WaitForSingleObject(*thread, INFINITE);
+    CloseHandle(*thread);
+    *thread = NULL;
+}
+
 static void StopRelay(void)
 {
     int i;
     InterlockedExchange(&g_stop, 1);
     if (g_hStopEvent) SetEvent(g_hStopEvent);
 
-    /* 鍏堝叧鐩戝惉/涓户濂楁帴瀛楁墦鐮撮樆濉?*/
     if (g_tcpListen != INVALID_SOCKET) { closesocket(g_tcpListen); g_tcpListen = INVALID_SOCKET; }
     if (g_udpSock != INVALID_SOCKET) { closesocket(g_udpSock); g_udpSock = INVALID_SOCKET; }
-    for (i = 0; i < MAX_UDP_FLOWS; i++)
-        if (g_flows[i].active) UdpCloseFlow(&g_flows[i], "stop");
 
-    if (g_hTcpAccept) { WaitForSingleObject(g_hTcpAccept, 5000); CloseHandle(g_hTcpAccept); g_hTcpAccept = NULL; }
-    if (g_hUdpThread) { WaitForSingleObject(g_hUdpThread, 5000); CloseHandle(g_hUdpThread); g_hUdpThread = NULL; }
-    if (g_hEvtThread) { WaitForSingleObject(g_hEvtThread, 2000); CloseHandle(g_hEvtThread); g_hEvtThread = NULL; }
-    if (g_hAutoThread) { WaitForSingleObject(g_hAutoThread, 5000); CloseHandle(g_hAutoThread); g_hAutoThread = NULL; }
+    JoinRelayThread(&g_hTcpAccept);
+    JoinRelayThread(&g_hUdpThread);
+    JoinRelayThread(&g_hEvtThread);
+    JoinRelayThread(&g_hAutoThread);
     if (g_udpBackMode == 3) {
         int i;
         EnterCriticalSection(&g_locCs);
@@ -2111,6 +2177,7 @@ BOOL WINAPI GetProcessFlow(BOOLEAN Switch, DWORD pid, unsigned long long* up, un
     if (!p) {
         key = pid;                       /* 鍏煎:鎸?PID 鐩存煡椹卞姩 */
     }
+    UdpFlushAccounting(key);
     if (!DevControl(IOCTL_HPX_QUERY_FLOW, &key, sizeof(key), &st, sizeof(st), &br) ||
         br < sizeof(st))
         return 0;

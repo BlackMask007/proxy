@@ -140,6 +140,7 @@ static int BuildDnsQuery(unsigned char* out, const char* name)
 
 static int ParseDnsAnswer(const unsigned char* d, int n, int* ancount)
 {
+    *ancount = 0;
     if (n < 12) return -1;
     if (d[0] != 0x34 || d[1] != 0x12) return -1;
     *ancount = (d[6] << 8) | d[7];
@@ -484,6 +485,7 @@ static int CmdE2E(const char* node, int nport, const char* user, const char* pas
         char exeA[MAX_PATH * 2], outFile[MAX_PATH * 2];
         WideCharToMultiByte(CP_UTF8, 0, selfPath, -1, exeA, sizeof(exeA), NULL, NULL);
         _snprintf_s(outFile, sizeof(outFile), _TRUNCATE, "%s.genout.txt", exeA);
+        DeleteFileA(outFile);
         _snprintf_s(childCmd, sizeof(childCmd), _TRUNCATE,
                     "\"%s\" gen \"%s\" --tcp %s --udp %s:%d", exeA, outFile, tcpTgt, udpTgt, udpPort);
         memset(&si, 0, sizeof(si));
@@ -513,8 +515,8 @@ static int CmdE2E(const char* node, int nport, const char* user, const char* pas
         return 1;
     }
 
-    /* 棰勭儹 UDP 鐩爣(鏈湴鍖?+ 缁戝畾鐩爣绔偣;娑堝簲鐢ㄩ鍖呯珵鎬? */
-    {
+    /* 仅本地化模式需要预热;其他回程模式调用会固定失败。 */
+    if (backMode == 3) {
         typedef BOOL (WINAPI *PFN_Pre)(const char*, int);
         PFN_Pre pPre = (PFN_Pre)GetProcAddress(g_dll, "HpxUdpPreTargetA");
         int preOk = pPre ? pPre(udpTgt, udpPort) : 0;
@@ -523,13 +525,23 @@ static int CmdE2E(const char* node, int nport, const char* user, const char* pas
 
     PrintDiag("PRE");
 
-    /* 绛夊瓙杩涚▼璺戝畬(鈮?0s) */
-    WaitForSingleObject(pi.hProcess, 90000);
+    {
+        DWORD waitRc = WaitForSingleObject(pi.hProcess, 90000);
+        DWORD exitCode = 0;
+        if (waitRc != WAIT_OBJECT_0) {
+            TerminateProcess(pi.hProcess, 4);
+            WaitForSingleObject(pi.hProcess, 5000);
+        }
+        GetExitCodeProcess(pi.hProcess, &exitCode);
+        Verdict("GEN-EXIT", waitRc == WAIT_OBJECT_0 && exitCode == 0,
+                waitRc == WAIT_OBJECT_0 ? "child completed" : "child timeout/wait failure");
+    }
     CloseHandle(pi.hProcess);
 
     /* 鏀跺瓙杩涚▼鍒ゆ嵁 */
     {
         char outFile[MAX_PATH * 2], line[512];
+        int genResultOk = 0;
         FILE* f;
         WideCharToMultiByte(CP_UTF8, 0, selfPath, -1, outFile, sizeof(outFile), NULL, NULL);
         _snprintf_s(outFile, sizeof(outFile), _TRUNCATE, "%s.genout.txt", outFile);
@@ -537,6 +549,7 @@ static int CmdE2E(const char* node, int nport, const char* user, const char* pas
         if (f) {
             while (fgets(line, sizeof(line), f)) {
                 line[strcspn(line, "\r\n")] = 0;
+                if (strcmp(line, "RESULT: PASS") == 0) genResultOk = 1;
                 if (strncmp(line, "MARKER-", 7) == 0) {
                     Emit("%s", line);
                     if (strstr(line, "FAIL")) g_pass = 0;
@@ -546,6 +559,7 @@ static int CmdE2E(const char* node, int nport, const char* user, const char* pas
         } else {
             Verdict("GENOUT", 0, "child output missing");
         }
+        Verdict("GEN-RESULT", genResultOk, genResultOk ? "fresh child PASS" : "child PASS missing");
     }
 
     PrintDiag("POST");

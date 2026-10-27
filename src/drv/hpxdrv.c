@@ -84,6 +84,7 @@ static WORK_QUEUE_ITEM  g_WfpWork;
 static WORK_QUEUE_ITEM  g_GcWork;
 static volatile LONG    g_WfpWorkQueued        = 0;
 static volatile LONG    g_GcQueued             = 0;
+static volatile LONG    g_Unloading            = 0;
 
 /* GC TTL(100ns tick,DriverEntry 鎹㈢畻;娉ㄥ唽琛ㄥ彲瑕嗙洊) */
 static LONGLONG         g_TickGcClaimed        = 0;
@@ -439,6 +440,10 @@ static void HpxGcWorker(PVOID ctx)
     ULONG budget = 256;
     KIRQL irql;
     UNREFERENCED_PARAMETER(ctx);
+    if (g_Unloading) {
+        InterlockedExchange(&g_GcQueued, 0);
+        return;
+    }
     KeQueryTickCount((PLARGE_INTEGER)&now);
     KeAcquireSpinLock(&g_TableLock, &irql);
     while (budget-- > 0) {
@@ -462,8 +467,13 @@ static void HpxGcWorker(PVOID ctx)
 
 static void HpxGcKick(void)
 {
+    if (g_Unloading) return;
     if ((InterlockedIncrement(&g_CntRewrite) & 0xFF) == 0 &&
         InterlockedCompareExchange(&g_GcQueued, 1, 0) == 0) {
+        if (g_Unloading) {
+            InterlockedExchange(&g_GcQueued, 0);
+            return;
+        }
         ExInitializeWorkItem(&g_GcWork, HpxGcWorker, NULL);
         ExQueueWorkItem(&g_GcWork, DelayedWorkQueue);
     }
@@ -894,15 +904,25 @@ static NTSTATUS WfpStartup(void)
 
 static void HpxWfpWorker(PVOID ctx)
 {
-    NTSTATUS st = WfpStartup();
+    NTSTATUS st;
+    UNREFERENCED_PARAMETER(ctx);
+    if (g_Unloading) {
+        InterlockedExchange(&g_WfpWorkQueued, 0);
+        return;
+    }
+    st = WfpStartup();
     if (!NT_SUCCESS(st)) g_WfpStatus = st;
     InterlockedExchange(&g_WfpWorkQueued, 0);
-    UNREFERENCED_PARAMETER(ctx);
 }
 
 static void WfpStartupAsync(void)
 {
+    if (g_Unloading) return;
     if (InterlockedCompareExchange(&g_WfpWorkQueued, 1, 0) == 0) {
+        if (g_Unloading) {
+            InterlockedExchange(&g_WfpWorkQueued, 0);
+            return;
+        }
         ExInitializeWorkItem(&g_WfpWork, HpxWfpWorker, NULL);
         ExQueueWorkItem(&g_WfpWork, DelayedWorkQueue);
     }
@@ -1121,6 +1141,7 @@ void DatagramClassify(
     NET_BUFFER* nb;
     PMDL mdl;
     UCHAR* p;
+    UCHAR* scratch = NULL;
     ULONG dlen, off;
     USHORT pktSrcH, pktDstH;
     ULONG srcIpF;
@@ -1151,13 +1172,12 @@ void DatagramClassify(
     if (dlen < 8 || dlen > 65535) goto permit;
     /* 整包连续化:NBL 的 MDL 常只含 UDP 头、载荷在后续 MDL,
      * 直接按 dlen 线性读会越过 MDL 边界取到脏内存(曾致注入载荷乱码) */
-    {
-        UCHAR* cont;
-        p = (UCHAR*)ExAllocatePoolWithTag(NonPagedPoolNx, dlen, HPX_POOL_TAG);
+    p = (UCHAR*)NdisGetDataBuffer(nb, dlen, NULL, 1, 0);
+    if (p == NULL) {
+        scratch = (UCHAR*)ExAllocatePoolWithTag(NonPagedPoolNx, dlen, HPX_POOL_TAG);
+        if (scratch == NULL) goto permit;
+        p = (UCHAR*)NdisGetDataBuffer(nb, dlen, scratch, 1, 0);
         if (p == NULL) goto permit;
-        cont = (UCHAR*)NdisGetDataBuffer(nb, dlen, p, 1, 0);
-        if (cont == NULL) { ExFreePoolWithTag(p, HPX_POOL_TAG); goto permit; }
-        if (cont != p) { RtlCopyMemory(p, cont, dlen); }
     }
 
     pktSrcH = (USHORT)((p[0] << 8) | p[1]);   /* 澶撮儴鎵嬪伐澶х瑙ｆ瀽 鈫?涓绘満搴?*/
@@ -1263,12 +1283,14 @@ void DatagramClassify(
         }
 
         /* 鍘熷寘鍚告敹 */
+        if (scratch) ExFreePoolWithTag(scratch, HPX_POOL_TAG);
         classifyOut->actionType = FWP_ACTION_BLOCK;
         classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
         return;
     }
 
 permit:
+    if (scratch) ExFreePoolWithTag(scratch, HPX_POOL_TAG);
     classifyOut->actionType = FWP_ACTION_PERMIT;
     classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
 }
@@ -1773,7 +1795,7 @@ static NTSTATUS IoctlReport(PVOID buf, ULONG inLen, ULONG_PTR* info)
 
 static NTSTATUS IoctlQueryFlow(PVOID buf, ULONG inLen, ULONG outLen, ULONG_PTR* info)
 {
-    ULONG id = *(ULONG*)buf;
+    ULONG id;
     HPX_FLOW_STAT* st = (HPX_FLOW_STAT*)buf;
     KIRQL irql;
     HPX_PROC* rec;
@@ -1781,6 +1803,7 @@ static NTSTATUS IoctlQueryFlow(PVOID buf, ULONG inLen, ULONG outLen, ULONG_PTR* 
     BOOLEAN ok = FALSE;
     if (inLen < sizeof(ULONG)) return STATUS_BUFFER_TOO_SMALL;
     if (outLen < sizeof(HPX_FLOW_STAT)) return STATUS_BUFFER_TOO_SMALL;
+    id = *(ULONG*)buf;
     KeAcquireSpinLock(&g_TableLock, &irql);
     rec = HpxFindProcByIdLocked(id);
     if (rec == NULL) rec = HpxFindProcByPidLocked(id);
@@ -1845,17 +1868,18 @@ static void NTAPI HpxProcessNotify(PEPROCESS process, HANDLE pid, PPS_CREATE_NOT
 static void HpxUnload(PDRIVER_OBJECT drv)
 {
     UNICODE_STRING dosName;
-    ULONG guard = 0;
     KIRQL irql;
 
     if (KeGetCurrentIrql() != PASSIVE_LEVEL) return;
+    g_Enabled = FALSE;
+    InterlockedExchange(&g_Unloading, 1);
     PsSetCreateProcessNotifyRoutineEx(HpxProcessNotify, TRUE);   /* 注销进程通知 */
 
-    /* 1) 鏈夌晫绛夊緟鍦ㄩ€斿伐浣滈」(30s;GC/WFP) */
+    /* 1) Wait for already-queued/running GC/WFP work items; new work is gated above. */
     {
         LARGE_INTEGER delay;
         delay.QuadPart = -(10 * 10000LL);            /* 10ms */
-        while ((g_WfpWorkQueued || g_GcQueued) && guard++ < 3000)
+        while (g_WfpWorkQueued || g_GcQueued)
             KeDelayExecutionThread(KernelMode, FALSE, &delay);
     }
 
@@ -2016,6 +2040,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING regPath)
 {
     NTSTATUS st;
     LONGLONG inc;
+    BOOLEAN notifyRegistered;
 
     HpxReadConfig(regPath);
 
@@ -2036,9 +2061,15 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT drv, PUNICODE_STRING regPath)
         g_TickGcUnclaimed = 20000;
     }
 
-    PsSetCreateProcessNotifyRoutineEx(HpxProcessNotify, FALSE);   /* 诞生即登记(映像名规则,置于全部初始化之后) */
+    st = PsSetCreateProcessNotifyRoutineEx(HpxProcessNotify, FALSE);
+    notifyRegistered = NT_SUCCESS(st);
+    if (!notifyRegistered) {
+        /* 部分测试签名环境拒绝该可选通知;引擎会显式推送映像规则,不阻止驱动加载。 */
+        DbgPrint("HPX: process notify unavailable st=0x%08x\n", st);
+    }
     st = HpxCreateDeviceSecure(drv);
     if (!NT_SUCCESS(st)) {
+        if (notifyRegistered) PsSetCreateProcessNotifyRoutineEx(HpxProcessNotify, TRUE);
         ExDeleteNPagedLookasideList(&g_FlowLookaside);
         ExDeleteNPagedLookasideList(&g_ProcLookaside);
         return st;

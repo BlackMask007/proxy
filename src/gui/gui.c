@@ -88,11 +88,13 @@ static volatile LONG g_driverBusy = 0;
 
 static void SetText(HWND h, const wchar_t* s) { SetWindowTextW(h, s); }
 
-static void GetEd(HWND h, char* out, int cap)
+static int GetEd(HWND h, char* out, int cap)
 {
     wchar_t w[256];
+    if (cap <= 0) return 0;
+    out[0] = 0;
     GetWindowTextW(h, w, 256);
-    WideCharToMultiByte(CP_UTF8, 0, w, -1, out, cap, NULL, NULL);
+    return WideCharToMultiByte(CP_UTF8, 0, w, -1, out, cap, NULL, NULL) > 0;
 }
 
 static void GetEdW(HWND h, wchar_t* out, int cap)
@@ -388,7 +390,10 @@ static int ResolveSelectedImage(char* image, int cap)
     for (i = 0; txt[i]; i++)
         if (!iswdigit(txt[i])) { digits = 0; break; }
     if (txt[0] && !digits) {
-        WideCharToMultiByte(CP_UTF8, 0, txt, -1, image, cap, NULL, NULL);
+        if (WideCharToMultiByte(CP_UTF8, 0, txt, -1, image, cap, NULL, NULL) <= 0) {
+            if (cap > 0) image[0] = 0;
+            return 0;
+        }
         return 1;
     }
     {
@@ -399,7 +404,10 @@ static int ResolveSelectedImage(char* image, int cap)
         sp = wcschr(line, L' ');          /* 行格式 "pid  image" */
         while (sp && *sp == L' ') sp++;
         if (!sp || !*sp) return 0;
-        WideCharToMultiByte(CP_UTF8, 0, sp, -1, image, cap, NULL, NULL);
+        if (WideCharToMultiByte(CP_UTF8, 0, sp, -1, image, cap, NULL, NULL) <= 0) {
+            if (cap > 0) image[0] = 0;
+            return 0;
+        }
         return 1;
     }
 }
@@ -459,9 +467,12 @@ static void DoCheckS5(void)
     char ip[64], user[64], pass[64];
     wchar_t wport[32];
     int port;
-    GetEd(g_hEdNode, ip, sizeof(ip));
-    GetEd(g_hEdUser, user, sizeof(user));
-    GetEd(g_hEdPass, pass, sizeof(pass));
+    if (!GetEd(g_hEdNode, ip, sizeof(ip)) ||
+        !GetEd(g_hEdUser, user, sizeof(user)) ||
+        !GetEd(g_hEdPass, pass, sizeof(pass))) {
+        SetText(g_hStEngine, L"引擎: 节点或认证信息过长/编码无效");
+        return;
+    }
     GetEdW(g_hEdPort, wport, 32);
     port = _wtoi(wport);
     if (pCheckSocks5 && pCheckSocks5(2, ip, port, user, pass)) {
@@ -483,10 +494,14 @@ static void DoStart(void)
         static const int map[4] = { 3, 1, 2, 0 };
         pBackMode((mode >= 0 && mode < 4) ? map[mode] : 3);
     }
-    if (pSetGlobal)
-        pSetGlobal(SendMessageW(g_hChkGlobal, BM_GETCHECK, 0, 0) == BST_CHECKED ? 1 : 0);
-    if (pInitData(0, 0, 0)) SetText(g_hStEngine, L"引擎: 运行中(中继已就绪)");
-    else SetText(g_hStEngine, L"引擎: 启动失败(查看日志)");
+    if (!pInitData(0, 0, 0)) {
+        SetText(g_hStEngine, L"引擎: 启动失败(查看日志)");
+    } else if (pSetGlobal &&
+               !pSetGlobal(SendMessageW(g_hChkGlobal, BM_GETCHECK, 0, 0) == BST_CHECKED ? 1 : 0)) {
+        SetText(g_hStEngine, L"引擎: 中继已启动,但全局模式设置失败");
+    } else {
+        SetText(g_hStEngine, L"引擎: 运行中(中继已就绪)");
+    }
     PullLog();
 }
 
@@ -505,11 +520,17 @@ static void DoAddPid(void)
     DWORD pid = 0;
     if (!ResolveSelectedPid(&pid)) { SetText(g_hStEngine, L"引擎: 请输入有效 PID 或在下拉中选进程"); return; }
     _snprintf_s(pidStr, sizeof(pidStr), _TRUNCATE, "%lu", pid);
-    GetEd(g_hEdNode, node, sizeof(node));
-    GetEd(g_hEdUser, user, sizeof(user));
-    GetEd(g_hEdPass, pass, sizeof(pass));
+    if (!GetEd(g_hEdNode, node, sizeof(node)) ||
+        !GetEd(g_hEdUser, user, sizeof(user)) ||
+        !GetEd(g_hEdPass, pass, sizeof(pass))) {
+        SetText(g_hStEngine, L"引擎: 节点或认证信息过长/编码无效");
+        return;
+    }
     GetEdW(g_hEdPort, wport, 32);
-    WideCharToMultiByte(CP_UTF8, 0, wport, -1, portStr, sizeof(portStr), NULL, NULL);
+    if (WideCharToMultiByte(CP_UTF8, 0, wport, -1, portStr, sizeof(portStr), NULL, NULL) <= 0) {
+        SetText(g_hStEngine, L"引擎: 端口格式无效");
+        return;
+    }
     if (pMakeKey) pMakeKey(pidStr, node, key);
     else key[0] = 0;
     if (pSetProxy && pSetProxy(0, pidStr, node, portStr, user, pass, key)) {

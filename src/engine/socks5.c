@@ -57,7 +57,7 @@ int s5_sendn(SOCKET s, const void* buf, int len)
 static int s5_read_reply(SOCKET s, struct sockaddr_in* bndOut)
 {
     unsigned char head[4];
-    unsigned char addr[16];
+    unsigned char addr[256];
     unsigned char pbuf[2];
     struct sockaddr_in bnd;
     if (s5_recvn(s, head, 4) < 0) return -1;
