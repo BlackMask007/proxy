@@ -418,3 +418,9 @@ E2E 回归全绿(e2e_notify.txt)。
   back=3 的 TCP/UDP/FLOW 全 PASS;前后 minidump 无新增。
   边界:同一受控环境 back=0 的 UDP 应用收包仍超时,本次不将 back=0/1/2
   宣称为已验证兼容;默认推荐 back=3。
+- **闲置后代理掉线/多实例误停(2026-10-28)**:现场 GUI 存活但 `relayPid=0 en=0`,
+  日志证明是另一探针实例调用 EmptyData 全局停用,并非闲置自发停止。
+  原驱动 `HPX_CTRL_ENABLE=0` 无视其他存活中继;现仅当请求者是最后一个中继时
+  才允许停用,HpxRelayDown/设备关闭也只在存活表归零时清 `g_Enabled`。
+  永久回归 `HpxProbe lifecycle2`:A 停止后 B 保持 `relayPid=B en=1`,
+  B 停止后才归零;单实例 lifecycle 同步通过。

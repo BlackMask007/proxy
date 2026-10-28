@@ -743,6 +743,53 @@ static int RunLifecycle(void)
     return ok3 ? 0 : 1;
 }
 
+static DWORD SpawnRelayStay(const wchar_t* selfPath, int port, int seconds, PROCESS_INFORMATION* pi)
+{
+    STARTUPINFOA si;
+    char cmd[MAX_PATH * 2];
+    memset(&si, 0, sizeof(si)); si.cb = sizeof(si);
+    memset(pi, 0, sizeof(*pi));
+    _snprintf_s(cmd, sizeof(cmd), _TRUNCATE, "\"%ls\" relay-stay %d %d", selfPath, port, seconds);
+    if (!CreateProcessA(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL, &si, pi)) return 0;
+    return pi->dwProcessId;
+}
+
+static int RunLifecycle2(void)
+{
+    wchar_t selfPath[MAX_PATH], diag[4096], pat[96];
+    PROCESS_INFORMATION a, b;
+    DWORD pidA, pidB;
+    int ok1, ok2;
+    if (LoadEngine() != 0) return 2;
+    GetModuleFileNameW(NULL, selfPath, MAX_PATH);
+    pidA = SpawnRelayStay(selfPath, 28118, 2, &a);
+    if (!pidA) { Emit("LIFE2-SPAWN-A FAIL"); return 1; }
+    Sleep(500);
+    pidB = SpawnRelayStay(selfPath, 28218, 7, &b);
+    if (!pidB) {
+        TerminateProcess(a.hProcess, 5);
+        CloseHandle(a.hProcess); CloseHandle(a.hThread);
+        Emit("LIFE2-SPAWN-B FAIL"); return 1;
+    }
+    Emit("LIFE2-UP A=%lu B=%lu", pidA, pidB);
+    Sleep(4000);
+    memset(diag, 0, sizeof(diag));
+    if (pDiag && pDiag(diag, 4096)) Emit("LIFE2-AFTER-A %ls", diag);
+    _snwprintf_s(pat, 96, _TRUNCATE, L"relayPid=%lu en=1", pidB);
+    ok1 = (wcsstr(diag, pat) != NULL);
+    Verdict("LIFE2-A-STOP", ok1, "B remains enabled after A stops");
+    WaitForSingleObject(b.hProcess, 12000);
+    WaitForSingleObject(a.hProcess, 2000);
+    memset(diag, 0, sizeof(diag));
+    if (pDiag && pDiag(diag, 4096)) Emit("LIFE2-AFTER-B %ls", diag);
+    ok2 = (wcsstr(diag, L"relayPid=0 en=0") != NULL);
+    Verdict("LIFE2-B-STOP", ok2, "disabled after last relay stops");
+    CloseHandle(a.hProcess); CloseHandle(a.hThread);
+    CloseHandle(b.hProcess); CloseHandle(b.hThread);
+    Emit("RESULT: %s", ok1 && ok2 ? "PASS" : "FAIL");
+    return ok1 && ok2 ? 0 : 1;
+}
+
 static void PrintUsage(void)
 {
     printf("HpxProbe e2e [--node ip:port] [--user u] [--pass p] [--tcp self|ip:port] [--udp ip:port] [--back 0|1|2|3]\n");
@@ -915,8 +962,23 @@ int main(int argc, char** argv)
         }
         if (pSt && pSt(st, 256)) Emit("DRIVER %ls", st);
         rc = g_pass ? 0 : 1;
+    } else if (strcmp(argv[1], "lifecycle2") == 0) {
+        rc = RunLifecycle2();
     } else if (strcmp(argv[1], "lifecycle") == 0) {
         rc = RunLifecycle();
+    } else if (strcmp(argv[1], "relay-stay") == 0) {
+        int port = (argc >= 3) ? atoi(argv[2]) : 28118;
+        int secs = (argc >= 4) ? atoi(argv[3]) : 5;
+        if (LoadEngine() != 0) return 2;
+        if (!pInitData(port, port + 1, 0)) {
+            Emit("RELAY-STAY-INIT-FAIL port=%d", port);
+            return 1;
+        }
+        Emit("RELAY-STAY-READY pid=%lu port=%d", GetCurrentProcessId(), port);
+        Sleep((DWORD)secs * 1000);
+        pEmptyData();
+        Emit("RELAY-STAY-DOWN pid=%lu", GetCurrentProcessId());
+        rc = 0;
     } else if (strcmp(argv[1], "relay-fail") == 0) {
         int port = (argc >= 3) ? atoi(argv[2]) : 28018;
         if (LoadEngine() != 0) return 2;

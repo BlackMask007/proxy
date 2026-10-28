@@ -380,6 +380,7 @@ static void HpxRelayDown(ULONG pid)
         }
     }
     g_RelayPid = g_RelayCount ? (LONG)g_RelayPids[g_RelayCount - 1] : 0;
+    if (g_RelayCount == 0) g_Enabled = FALSE;
     KeReleaseSpinLock(&g_TableLock, irql);
 }
 
@@ -1376,7 +1377,16 @@ static NTSTATUS IoctlControl(PVOID buf, ULONG inLen, ULONG outLen, ULONG_PTR* in
         if (param >= 1 && param <= 0xFFFF) g_RelayPortUdp = (USHORT)param;
         return STATUS_SUCCESS;
     case HPX_CTRL_ENABLE:
-        g_Enabled = param ? TRUE : FALSE;
+        if (param) {
+            g_Enabled = TRUE;
+        } else {
+            KIRQL irql;
+            ULONG pid = (ULONG)(ULONG_PTR)PsGetCurrentProcessId();
+            KeAcquireSpinLock(&g_TableLock, &irql);
+            if (g_RelayCount == 0 ||
+                (g_RelayCount == 1 && g_RelayPids[0] == pid)) g_Enabled = FALSE;
+            KeReleaseSpinLock(&g_TableLock, irql);
+        }
         return STATUS_SUCCESS;
     case HPX_CTRL_RESET: {
         KIRQL irql;
