@@ -2,7 +2,7 @@
 
 > 目标:在独立工程中实现**原厂 HookProxy.dll 的透明代理功能**(重点 UDP 代理),
 > 提供 GUI 手动测试台(驱动安装/卸载、按进程代理、启停、状态/流量),
-> 以 SOCKS5 上游节点 `10.10.10.254:1081` 跑通验证(3 连 PASS,见 evidence\)。
+> 以 SOCKS5 上游节点 `10.10.10.254:1081` 完成 TCP/UDP back=3、生命周期与压力回归验证。
 >
 > 参考物:`E:\hooksocks\unpack\HookProxy_unpacked.dll`(原厂二进制脱壳件,逆向分析基准)与 `E:\hooksocks`
 > (其他会话的逆向/实现记录,**只读参考**;本工程未改动其任何文件)。
@@ -84,23 +84,25 @@ sign.cmd build\HpxDrv64.sys
 build\user\HpxGui.exe
 :: 1) [驱动] 安装驱动(复制 exe 同目录 HpxDrv64.sys → 装服务 → 启动)
 :: 2) [上游 SOCKS5] 默认 10.10.10.254:1081 → 测试连接
-:: 3) [引擎] 启动代理(UDP 回程模式选"自动")
+::: 3) [引擎] UDP 回程选“自动(本地化,推荐)”(back=3)，再启动代理
 :: 4) [按进程代理] 搜索框输入 PID 或进程名(实时过滤下拉,模糊匹配、按映像名排序)
 ::    → [按PID代理] 登记单个 / [按进程名代理] 一键代理全部同名进程
 ::    (含后期新启动的,≤1s 自动关联,退出自动注销)
 :: 5) 运行产生流量的程序;状态/流量面板实时刷新(上/下行字节、驱动计数、日志)
 ```
 
-## 自动化验证(E2E)
+## 自动化验证
 
 ```cmd
-:: VM 内(管理员):tools\run_e2e.bat
-:: 判据(全绿 = PASS):
-::   MARKER-{INIT,CHECK,SET,PRETARGET,NEGCTRL,TCP,UDP-CONN,UDP-SENDTO,FLOW,STOP,TEARDOWN}
-::   + RESULT: PASS + FLOW 计费闸(up≥70 且 down≥250 = TCP+双 UDP 全经代理的硬证明)
-::   + minidump 前后清点零新增(L4)
-evidence\e2e_v5.txt / e2e_repeat_final.txt —— 3 连 PASS 实录
+::: 构建(宿主):build.cmd all
+::: 驱动/中继生命周期(VM 内管理员):tools\relay_lifecycle.bat
+::: 真实节点端到端(VM 内管理员):
+HpxProbe e2e --node 10.10.10.254:1081 --tcp 223.5.5.5:80 --udp 223.5.5.5:53 --back 3
 ```
+
+通过条件:生命周期全部 PASS;E2E 的子进程正常退出且输出为本次新结果,
+TCP/UDP/FLOW 等 MARKER 全部 OK 并取得 `RESULT: PASS`;驱动测试前后
+minidump 清单无新增。原始 evidence 目录已清理,当前结论与边界以本文为准。
 
 探针目标说明(网络边界):探针进程直连仅到上游 `10.10.10.254:1081`
 (及其 UDP ASSOCIATE 伴随端点,协议必需);测试目标流量全部经节点中继:

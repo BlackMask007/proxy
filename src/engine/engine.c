@@ -1871,7 +1871,6 @@ static void JoinRelayThread(HANDLE* thread)
 
 static void StopRelay(void)
 {
-    int i;
     InterlockedExchange(&g_stop, 1);
     if (g_hStopEvent) SetEvent(g_hStopEvent);
 

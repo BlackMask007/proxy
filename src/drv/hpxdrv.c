@@ -942,7 +942,6 @@ void RedirectClassify(
     UCHAR protocol;
     ULONG remoteIpF, localIpF;
     USHORT remotePortH, localPortH;
-    HPX_PROC* proc;
     ULONG hitPid = 0;
     KIRQL irql;
 
@@ -1049,7 +1048,7 @@ void RedirectClassify(
          * 任一其他中继实例退出不再误伤在运中继(2026-10-18 间隔掉线修复)。 */
         if (g_RelayPid == 0) goto permit;
 
-        st = FwpsAcquireClassifyHandle(classifyContext, 0, &classifyHandle);
+        st = FwpsAcquireClassifyHandle((void*)classifyContext, 0, &classifyHandle);
         if (!NT_SUCCESS(st)) goto permit;
         st = FwpsAcquireWritableLayerDataPointer0(classifyHandle, filter->filterId, 0,
                                                   (PVOID*)&cr, classifyOut);
@@ -1143,7 +1142,7 @@ void DatagramClassify(
     PMDL mdl;
     UCHAR* p;
     UCHAR* scratch = NULL;
-    ULONG dlen, off;
+    ULONG dlen;
     USHORT pktSrcH, pktDstH;
     ULONG srcIpF;
     KIRQL irql;
@@ -1169,7 +1168,6 @@ void DatagramClassify(
     dlen = NET_BUFFER_DATA_LENGTH(nb);
     mdl = NET_BUFFER_CURRENT_MDL(nb);
     if (mdl == NULL) goto permit;
-    off = NET_BUFFER_CURRENT_MDL_OFFSET(nb);
     if (dlen < 8 || dlen > 65535) goto permit;
     /* 整包连续化:NBL 的 MDL 常只含 UDP 头、载荷在后续 MDL,
      * 直接按 dlen 线性读会越过 MDL 边界取到脏内存(曾致注入载荷乱码) */
